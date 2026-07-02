@@ -7,95 +7,14 @@ import torchvision as tv
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import v2
 
+from autoencoder import VAEConfig, VariationalAutoEncoder
+
 
 def load_dataset(train: bool):
     transforms = v2.Compose(
         [v2.PILToTensor(), v2.Resize((32, 32)), v2.ToDtype(torch.float32, scale=True)]
     )
     return tv.datasets.MNIST(".", download=True, transform=transforms, train=train)
-
-
-class GaussianEncoder(torch.nn.Module):
-    def __init__(self, channel_dims=None, latent_dim=16):
-        super().__init__()
-        self._latent_dim = latent_dim
-        if channel_dims is None:
-            channel_dims = [8, 16, 32]
-        channels = [1] + channel_dims
-        layers = []
-        for idx in range(len(channels) - 1):
-            in_channels = channels[idx]
-            out_channels = channels[idx + 1]
-            layers += [
-                torch.nn.Conv2d(
-                    in_channels, out_channels, kernel_size=3, stride=2, padding=1
-                ),
-                torch.nn.GroupNorm(4, out_channels),
-                torch.nn.ReLU(),
-            ]
-        layers += [
-            torch.nn.Conv2d(channels[-1], 2 * latent_dim, kernel_size=1, stride=1),
-            torch.nn.GroupNorm(4, 2 * latent_dim),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(2 * latent_dim, 2 * latent_dim, kernel_size=1, stride=1),
-        ]
-
-        self._layers = torch.nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self._layers(x)
-        mu = out[:, : self._latent_dim]
-        logvar = out[:, self._latent_dim :]
-        return mu, logvar
-
-
-class GaussianDecoder(torch.nn.Module):
-    def __init__(self, channel_dims=None, latent_dim=16):
-        super().__init__()
-        if channel_dims is None:
-            channel_dims = [32, 16, 8]
-        channels = [latent_dim] + channel_dims
-
-        layers = []
-        for idx in range(len(channels) - 1):
-            in_channels = channels[idx]
-            out_channels = channels[idx + 1]
-            layers += [
-                torch.nn.Upsample(scale_factor=2),
-                torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-                torch.nn.GroupNorm(4, out_channels),
-                torch.nn.ReLU(),
-            ]
-        layers += [
-            torch.nn.Conv2d(channels[-1], 1, kernel_size=1, stride=1),
-        ]
-
-        self._layers = torch.nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor):
-        return self._layers(x)
-
-
-class VariationalAutoEncoder(torch.nn.Module):
-    def __init__(self, channel_dims: list[int], latent_dim: int):
-        super().__init__()
-        self._encoder = GaussianEncoder(
-            channel_dims=channel_dims, latent_dim=latent_dim
-        )
-        self._decoder = GaussianDecoder(
-            channel_dims=channel_dims[::-1], latent_dim=latent_dim
-        )
-
-    def forward(self, x):
-        # Compute the latent mean and variance
-        mu, logvar = self._encoder(x)
-        std = torch.exp(0.5 * logvar)
-
-        # Sample a latent
-        z = std * torch.randn_like(mu) + mu
-
-        # run latents through a decoder
-        return mu, logvar, z, self._decoder(z)
 
 
 def compute_reverse_kl_loss(mu: torch.Tensor, logvar: torch.Tensor, should_reduce=True):
@@ -143,9 +62,9 @@ def log_validation_metrics(model, dataloader, writer, batch_size, epoch_idx):
     kl_loss = kl_loss / num_items
     reconstruction_loss = reconstruction_loss / num_items
 
-    writer.add_scalar("val/kl_loss", kl_loss.item(), global_step=epoch_idx)
+    writer.add_scalar("val/kl_loss", kl_loss, global_step=epoch_idx)
     writer.add_scalar(
-        "val/reconstruction_loss", reconstruction_loss.item(), global_step=epoch_idx
+        "val/reconstruction_loss", reconstruction_loss, global_step=epoch_idx
     )
     writer.add_images("val/target", imgs[:16], global_step=epoch_idx)
     writer.add_images("val/recon", F.sigmoid(x_prime_logit[:16]), global_step=epoch_idx)
@@ -153,7 +72,7 @@ def log_validation_metrics(model, dataloader, writer, batch_size, epoch_idx):
         "val/kl_per_dim",
         min=kl_bins[0],
         max=kl_bins[-1],
-        num=kl_counts.sum(),
+        num=0 if kl_counts is None else kl_counts.sum(),
         sum=kl_sum,
         sum_squares=kl_sum_squares,
         bucket_limits=kl_bins[1:],
@@ -203,9 +122,8 @@ def main(
     )
 
     # Build the model
-    autoencoder = VariationalAutoEncoder(
-        channel_dims=[8, 16, 32], latent_dim=latent_dim
-    ).cuda()
+    config = VAEConfig(channel_dims=[8, 16, 32], latent_dim=latent_dim)
+    autoencoder = VariationalAutoEncoder(config).cuda()
 
     opt = torch.optim.Adam(autoencoder.parameters(), lr=learning_rate)
 
@@ -242,11 +160,9 @@ def main(
         )
 
         if epoch_idx % 5 == 0:
-            torch.save(
-                autoencoder.state_dict(), log_dir / f"autoencoder_{epoch_idx:03d}.pt"
-            )
+            autoencoder.save(log_dir / f"autoencoder_{epoch_idx:03d}.pt")
 
-    torch.save(autoencoder.state_dict(), log_dir / f"autoencoder_{epoch_idx:03d}.pt")
+    autoencoder.save(log_dir / f"autoencoder_{epoch_idx:03d}.pt")
     # Train the model
     print("Hello from vae!")
 
@@ -258,7 +174,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--kl_factor", type=float, default=1.0)
     parser.add_argument("--latent_dim", type=int, default=16)
-    parser.add_argument("--log_dir", required=True)
+    parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
     main(
         args.num_epochs,
@@ -266,5 +182,5 @@ if __name__ == "__main__":
         args.learning_rate,
         args.kl_factor,
         args.latent_dim,
-        Path(args.log_dir),
+        Path(args.output_dir),
     )
