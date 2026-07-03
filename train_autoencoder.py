@@ -7,7 +7,7 @@ import torchvision as tv
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import v2
 
-from autoencoder import VAEConfig, VariationalAutoEncoder
+from autoencoder import VariationalAutoEncoder, VariationalAutoEncoderConfig
 
 
 def load_dataset(train: bool):
@@ -122,7 +122,9 @@ def main(
     )
 
     # Build the model
-    config = VAEConfig(channel_dims=[8, 16, 32], latent_dim=latent_dim)
+    config = VariationalAutoEncoderConfig(
+        channel_dims=[8, 16, 32], latent_dim=latent_dim
+    )
     autoencoder = VariationalAutoEncoder(config).cuda()
 
     opt = torch.optim.Adam(autoencoder.parameters(), lr=learning_rate)
