@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from autoencoder import VariationalAutoEncoder
 from conditional_prior import (
@@ -21,16 +22,61 @@ def compute_kl_loss(
     pred_logvar: torch.Tensor,
     target_mu: torch.Tensor,
     target_logvar: torch.Tensor,
+    should_reduce=True,
 ):
     normalizer_term = pred_logvar - target_logvar
     det_trace_term = torch.exp(target_logvar - pred_logvar)
-    dimension_term = 1
+    dimension_term = -1
     mean_term = (target_mu - pred_mu) ** 2 * torch.exp(-pred_logvar)
     kl_divergence = 0.5 * (
-        normalizer_term - dimension_term + det_trace_term + mean_term
+        normalizer_term + dimension_term + det_trace_term + mean_term
     )
-    kl_loss = kl_divergence.sum((1, 2, 3)).mean()
+    if should_reduce:
+        kl_loss = kl_divergence.sum((1, 2, 3)).mean()
+    else:
+        kl_loss = kl_divergence
     return kl_loss
+
+
+def log_train_metrics(
+    kl_divergence: float, writer: SummaryWriter, total_batch_idx: int
+):
+    writer.add_scalar("train/kl_divergence", kl_divergence, global_step=total_batch_idx)
+
+
+def log_validation_metrics(
+    dataloader: torch.utils.data.DataLoader,
+    autoencoder: VariationalAutoEncoder,
+    conditional_prior: ConditionalPrior,
+    writer: SummaryWriter,
+    batch_size: int,
+    epoch_idx: int,
+):
+    conditional_prior.eval()
+
+    kl_loss = 0.0
+    num_items = 0.0
+    with torch.no_grad():
+        for imgs, labels in dataloader:
+            target_mu, target_logvar, z = autoencoder.sample_latents(imgs.cuda())
+            pred = conditional_prior(ConditioningSignal(digit_class=labels.cuda()), z)
+            kl_raw = (
+                compute_kl_loss(
+                    pred_mu=pred.mu,
+                    pred_logvar=pred.logvar,
+                    target_mu=target_mu,
+                    target_logvar=target_logvar,
+                    should_reduce=False,
+                )
+                .mean(dim=0)
+                .flatten()
+            )
+            kl_loss += kl_raw.sum()
+            num_items += imgs.shape[0] / batch_size
+    kl_loss = kl_loss / num_items
+    writer.add_scalar("val/kl_loss", kl_loss, global_step=epoch_idx)
+
+    conditional_prior.train()
 
 
 def main(
@@ -48,10 +94,15 @@ def main(
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True
     )
+    validation_dataset = load_dataset(train=False)
+    validation_dataloader = torch.utils.data.DataLoader(
+        validation_dataset, batch_size=batch_size
+    )
 
     # Load the autoencoder and pass an image through to learn
     # latent dimension
     autoencoder = load_autoencoder(autoencoder_path).cuda()
+    autoencoder.eval()
     img = next(iter(train_dataloader))[0].cuda()
     _, _, z, _ = autoencoder(img)
 
@@ -65,11 +116,27 @@ def main(
             num_layers=num_layers,
         )
     ).cuda()
+    prior.train()
+
+    writer = SummaryWriter(output_dir)
+    writer.add_hparams(
+        {
+            "model_dim": model_dim,
+            "num_attention_heads": num_attention_heads,
+            "num_layers": num_layers,
+            "num_epochs": num_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+        },
+        {},
+    )
 
     opt = torch.optim.Adam(prior.parameters(), lr=learning_rate)
 
+    total_batch_idx = 0
     for epoch_idx in range(num_epochs):
         for batch_idx, (imgs, labels) in enumerate(train_dataloader):
+            total_batch_idx += 1
             with torch.no_grad():
                 target_mu, target_logvar, z = autoencoder.sample_latents(imgs.cuda())
 
@@ -87,10 +154,14 @@ def main(
             )
             loss.backward()
             opt.step()
-
+            log_train_metrics(loss.detach().item(), writer, total_batch_idx)
             print(
                 f"{epoch_idx=} {batch_idx=} loss={loss.detach().item():0.3f}", end="\r"
             )
+        log_validation_metrics(
+            validation_dataloader, autoencoder, prior, writer, batch_size, epoch_idx
+        )
+
         print()
 
 
