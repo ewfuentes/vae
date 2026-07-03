@@ -31,7 +31,7 @@ class ConditioningEmbedding(torch.nn.Module):
         self.digit_embedding = torch.nn.Embedding(NUM_DIGITS, model_dim)
 
     def forward(self, conditioning: ConditioningSignal) -> torch.Tensor:
-        return self.digit_embedding(conditioning.digit_class)
+        return self.digit_embedding(conditioning.digit_class).unsqueeze(1)
 
 
 class ConditionalPrior(torch.nn.Module):
@@ -46,8 +46,9 @@ class ConditionalPrior(torch.nn.Module):
             torch.randn((num_position_embeddings, self.config.model_dim))
         )
 
-        self._input_projector = torch.nn.Linear(
-            self.config.latent_feature_dim, self.config.model_dim
+        self._input_projector = torch.nn.Sequential(
+            torch.nn.Linear(self.config.latent_feature_dim, self.config.model_dim),
+            torch.nn.LayerNorm(self.config.model_dim),
         )
 
         self._output_projector = torch.nn.Linear(
@@ -62,7 +63,7 @@ class ConditionalPrior(torch.nn.Module):
             norm_first=True,
         )
         self._transformer = torch.nn.TransformerEncoder(
-            encoder_layer, num_layers=self.config.num_layers
+            encoder_layer, num_layers=self.config.num_layers, enable_nested_tensor=False
         )
 
     def forward(
@@ -95,7 +96,7 @@ class ConditionalPrior(torch.nn.Module):
 
         # Create a causal attention mask
         attention_mask = torch.nn.Transformer.generate_square_subsequent_mask(
-            input_tokens.shape[1]
+            input_tokens.shape[1], device=input_tokens.device
         )
 
         # Run it through the transformer decoder

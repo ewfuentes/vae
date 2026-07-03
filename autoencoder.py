@@ -81,13 +81,18 @@ class VariationalAutoEncoder(torch.nn.Module):
             latent_dim=self.config.latent_dim,
         )
 
-    def forward(self, x):
+    def sample_latents(self, x):
         # Compute the latent mean and variance
         mu, logvar = self._encoder(x)
         std = torch.exp(0.5 * logvar)
 
         # Sample a latent
         z = std * torch.randn_like(mu) + mu
+        return mu, logvar, z
+
+    def forward(self, x):
+        # sample latents
+        mu, logvar, z = self.sample_latents(x)
 
         # run latents through a decoder
         return mu, logvar, z, self._decoder(z)
