@@ -1,4 +1,5 @@
 import argparse
+from enum import auto
 from pathlib import Path
 
 import torch
@@ -73,8 +74,20 @@ def log_validation_metrics(
             )
             kl_loss += kl_raw.sum()
             num_items += imgs.shape[0] / batch_size
+
     kl_loss = kl_loss / num_items
     writer.add_scalar("val/kl_loss", kl_loss, global_step=epoch_idx)
+
+    # Sample some images using the conditioned prior
+    digit_classes = torch.arange(10, dtype=torch.int32).repeat_interleave(5)
+    sampled_latents = conditional_prior.generate(
+        ConditioningSignal(digit_class=digit_classes.cuda())
+    )
+
+    reconstructed_images = autoencoder._decoder(sampled_latents)
+    writer.add_images(
+        "val/digit_samples", torch.sigmoid(reconstructed_images), global_step=epoch_idx
+    )
 
     conditional_prior.train()
 

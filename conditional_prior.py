@@ -119,19 +119,51 @@ class ConditionalPrior(torch.nn.Module):
         conditioning_signal: ConditioningSignal,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        # Inference-time ancestral sampling (NOT teacher forced): the sequence
-        # starts as just the conditioning token and grows one latent at a time.
-        #
-        # Embed the conditioning signal -> the first (position 0) token.
-        # Let N = prod(latent_spatial_dims) be the number of latents to sample.
-        # For step i in range(N):
-        #   - Add position embeddings to the current (i+1)-length sequence
-        #   - Run it through the transformer decoder with a causal mask
-        #     (a KV cache is optional; negligible for N this small)
-        #   - Take the LAST position's output -> output projector -> (mu, logvar)
-        #   - Sample z_i = mu + temperature * exp(0.5 * logvar) * randn_like(mu)
-        #     (temperature < 1 = less diverse / sharper; > 1 = more diverse)
-        #   - Project z_i back to model_dim and APPEND it as the next input token
-        # Stack the sampled z_i and reshape [B, N, C] -> the latent grid
-        # [B, C, H, W] so it can be handed straight to the VAE decoder.
-        ...
+        # Create the conditioning tokens
+        input_tokens = self._conditioning_embedding(conditioning_signal)
+        assert input_tokens.shape[1] == 1
+        assert input_tokens.shape[2] == self.config.model_dim
+        batch_size = input_tokens.shape[0]
+
+        num_tokens_to_sample = math.prod(self.config.latent_spatial_dims)
+
+        sampled_latents = []
+
+        for latent_idx in range(num_tokens_to_sample):
+            # Add a position embedding to the last input token
+            input_tokens[:, -1:] += self._position_embedding[latent_idx].reshape(
+                1, 1, -1
+            )
+
+            attention_mask = torch.nn.Transformer.generate_square_subsequent_mask(
+                input_tokens.shape[1], device=input_tokens.device
+            )
+
+            # Compute the next token distribution
+            output_tokens = self._transformer(
+                input_tokens, mask=attention_mask, is_causal=True
+            )
+
+            # Extract the mean and variance
+            output_distribution = self._output_projector(output_tokens[:, -1])
+            mu = output_distribution[:, : self.config.latent_feature_dim]
+            logvar = output_distribution[:, self.config.latent_feature_dim :]
+            std = torch.exp(0.5 * logvar)
+
+            # sample the latent
+            latent = mu + temperature * std * torch.randn_like(mu)
+            assert latent.ndim == 2
+            assert latent.shape[0] == batch_size
+            assert latent.shape[1] == self.config.latent_feature_dim
+
+            # Add the new latent to the list of input tokens
+            sampled_latents.append(latent)
+            new_input_tokens = self._input_projector(latent).unsqueeze(1)
+            input_tokens = torch.cat([input_tokens, new_input_tokens], dim=1)
+
+        # Collect all of the sampled latents and reshape
+        sampled_latents = torch.stack(sampled_latents, dim=-1).reshape(
+            batch_size, self.config.latent_feature_dim, *self.config.latent_spatial_dims
+        )
+
+        return sampled_latents
