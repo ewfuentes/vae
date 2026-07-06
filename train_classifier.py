@@ -9,6 +9,8 @@ from dataset import load_dataset
 
 
 def main(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     train_dataset = load_dataset(train=True)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, shuffle=True, batch_size=1024
@@ -62,13 +64,16 @@ def main(output_dir: Path):
 
         model.train()
 
+    # Save the final model.
+    model.save(output_dir / "classifier.pt")
+
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir")
+    parser.add_argument("--output_dir", required=True)
 
     args = parser.parse_args()
 
-    main(args.output_dir)
+    main(Path(args.output_dir))

@@ -48,3 +48,20 @@ class Classifier(torch.nn.Module):
 
     def forward(self, x):
         return self._model(x)
+
+    def save(self, path):
+        torch.save(
+            {
+                "config": msgspec.to_builtins(self.config),
+                "state_dict": self.state_dict(),
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path, map_location=None):
+        ckpt = torch.load(path, map_location=map_location, weights_only=True)
+        config = msgspec.convert(ckpt["config"], ClassifierConfig)
+        model = cls(config)
+        model.load_state_dict(ckpt["state_dict"])
+        return model
