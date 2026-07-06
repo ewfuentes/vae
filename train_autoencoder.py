@@ -1,11 +1,18 @@
 import argparse
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")  # headless: build figures without a display
+
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics import ConfusionMatrix
 
 from autoencoder import VariationalAutoEncoder, VariationalAutoEncoderConfig
+from classifier import Classifier
 from dataset import load_dataset
 
 
@@ -26,19 +33,36 @@ def compute_reconstruction_loss(x, x_prime_logit):
     return loss / x.shape[0]
 
 
-def log_validation_metrics(model, dataloader, writer, batch_size, epoch_idx):
+def log_validation_metrics(
+    model, classifier, dataloader, writer, batch_size, epoch_idx
+):
     model.eval()
+    num_batches = 0
     num_items = 0
+    match_count = 0
     kl_loss = 0.0
     kl_sum = 0.0
     kl_sum_squares = 0.0
     reconstruction_loss = 0.0
     kl_counts = None
     kl_bins = torch.linspace(0, 5, 101)
+    # rows = class of the real image, cols = class of its reconstruction
+    confusion_matrix = ConfusionMatrix(
+        task="multiclass", num_classes=10, normalize="true"
+    )
     with torch.no_grad():
         for imgs, _ in dataloader:
             imgs = imgs.cuda()
             mu, logvar, _, x_prime_logit = model(imgs)
+
+            image_preds = classifier(imgs)
+            xprime_preds = classifier(F.sigmoid(x_prime_logit))
+            image_preds = torch.argmax(image_preds, dim=-1)
+            xprime_preds = torch.argmax(xprime_preds, dim=-1)
+            match_count += (image_preds == xprime_preds).sum()
+            num_items += imgs.shape[0]
+            confusion_matrix.update(xprime_preds.cpu(), image_preds.cpu())
+
             raw_kl = (
                 compute_reverse_kl_loss(mu, logvar, should_reduce=False)
                 .mean(dim=(0))
@@ -46,20 +70,26 @@ def log_validation_metrics(model, dataloader, writer, batch_size, epoch_idx):
             )
             new_counts, _ = torch.histogram(raw_kl.cpu(), kl_bins)
             kl_sum += raw_kl.sum()
-            kl_sum_squares = (raw_kl**2).sum()
+            kl_sum_squares += (raw_kl**2).sum()
             kl_counts = new_counts if kl_counts is None else new_counts + kl_counts
             kl_loss += raw_kl.sum()
             reconstruction_loss += compute_reconstruction_loss(imgs, x_prime_logit)
-            num_items += imgs.shape[0] / batch_size
-    kl_loss = kl_loss / num_items
-    reconstruction_loss = reconstruction_loss / num_items
+            num_batches += imgs.shape[0] / batch_size
+    kl_loss = kl_loss / num_batches
+    reconstruction_loss = reconstruction_loss / num_batches
 
+    writer.add_scalar(
+        "val/classification_accuracy", match_count / num_items, global_step=epoch_idx
+    )
     writer.add_scalar("val/kl_loss", kl_loss, global_step=epoch_idx)
     writer.add_scalar(
         "val/reconstruction_loss", reconstruction_loss, global_step=epoch_idx
     )
     writer.add_images("val/target", imgs[:16], global_step=epoch_idx)
     writer.add_images("val/recon", F.sigmoid(x_prime_logit[:16]), global_step=epoch_idx)
+    cm_fig, _ = confusion_matrix.plot()
+    writer.add_figure("val/confusion_matrix", cm_fig, global_step=epoch_idx)
+    plt.close(cm_fig)
     writer.add_histogram_raw(
         "val/kl_per_dim",
         min=kl_bins[0],
@@ -91,7 +121,11 @@ def main(
     kl_factor: float,
     latent_dim: int,
     log_dir: Path,
+    classifier_path: Path,
 ):
+    # Load the classifier for validation metrics
+    mnist_classifier = Classifier.load(classifier_path).cuda()
+
     # Build a dataset
     train_dataset = load_dataset(train=True)
     train_loader = torch.utils.data.DataLoader(
@@ -147,6 +181,7 @@ def main(
         print()
         log_validation_metrics(
             model=autoencoder,
+            classifier=mnist_classifier,
             dataloader=test_loader,
             writer=writer,
             batch_size=batch_size,
@@ -169,6 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--kl_factor", type=float, default=1.0)
     parser.add_argument("--latent_dim", type=int, default=16)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--classifier_path", required=True)
     args = parser.parse_args()
     main(
         args.num_epochs,
@@ -177,4 +213,5 @@ if __name__ == "__main__":
         args.kl_factor,
         args.latent_dim,
         Path(args.output_dir),
+        Path(args.classifier_path),
     )
