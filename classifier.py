@@ -1,6 +1,5 @@
 import msgspec
 import torch
-import torch.nn.functional as F
 
 
 class ClassifierConfig(msgspec.Struct):
@@ -41,13 +40,16 @@ class Classifier(torch.nn.Module):
             ),
             torch.nn.ReLU(),
             torch.nn.Flatten(),
-            torch.nn.LazyLinear(self.config.out_dim),
         ]
+        self._feature_extractor = torch.nn.Sequential(*layers)
+        self._classifier_layer = torch.nn.LazyLinear(self.config.out_dim)
 
-        self._model = torch.nn.Sequential(*layers)
+    def features(self, x):
+        return self._feature_extractor(x)
 
     def forward(self, x):
-        return self._model(x)
+        features = self.features(x)
+        return self._classifier_layer(features)
 
     def save(self, path):
         torch.save(
