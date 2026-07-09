@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics import ConfusionMatrix
+from torchmetrics.image.kid import KernelInceptionDistance
 
 from autoencoder import VariationalAutoEncoder, VariationalAutoEncoderConfig
 from classifier import Classifier
@@ -34,7 +35,7 @@ def compute_reconstruction_loss(x, x_prime_logit):
 
 
 def log_validation_metrics(
-    model, classifier, dataloader, writer, batch_size, epoch_idx
+    model, classifier, dataloader, kid, writer, batch_size, epoch_idx
 ):
     model.eval()
     num_batches = 0
@@ -51,10 +52,12 @@ def log_validation_metrics(
         task="multiclass", num_classes=10, normalize="true"
     )
     with torch.no_grad():
+        kid.reset()
         for imgs, _ in dataloader:
             imgs = imgs.cuda()
             mu, logvar, _, x_prime_logit = model(imgs)
 
+            kid.update(F.sigmoid(x_prime_logit), real=False)
             image_preds = classifier(imgs)
             xprime_preds = classifier(F.sigmoid(x_prime_logit))
             image_preds = torch.argmax(image_preds, dim=-1)
@@ -85,9 +88,13 @@ def log_validation_metrics(
     writer.add_scalar(
         "val/reconstruction_loss", reconstruction_loss, global_step=epoch_idx
     )
+    kid_mean, kid_std = kid.compute()
+    writer.add_scalar("val/kid_mean", kid_mean, global_step=epoch_idx)
+    writer.add_scalar("val/kid_std", kid_std, global_step=epoch_idx)
     writer.add_images("val/target", imgs[:16], global_step=epoch_idx)
     writer.add_images("val/recon", F.sigmoid(x_prime_logit[:16]), global_step=epoch_idx)
-    cm_fig, _ = confusion_matrix.plot()
+    cm_fig = plt.figure(figsize=(8, 8))
+    cm_fig, _ = confusion_matrix.plot(ax=plt.gca())
     writer.add_figure("val/confusion_matrix", cm_fig, global_step=epoch_idx)
     plt.close(cm_fig)
     writer.add_histogram_raw(
@@ -114,6 +121,24 @@ def log_train_metrics(kl_loss, reconstruction_loss, writer, total_batch_idx):
     )
 
 
+def create_kid_object(dataloader, classifier):
+    class _Features(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self._model = model
+
+        def forward(self, x):
+            return self._model.features(x)
+
+    kid = KernelInceptionDistance(
+        feature=_Features(classifier), reset_real_features=False, normalize=True
+    )
+    with torch.no_grad():
+        for imgs, _ in dataloader:
+            kid.update(imgs.cuda(), real=True)
+    return kid
+
+
 def main(
     num_epochs: int,
     batch_size: int,
@@ -133,6 +158,8 @@ def main(
     )
     test_dataset = load_dataset(train=False)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size)
+
+    kid = create_kid_object(test_loader, mnist_classifier)
 
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir)
@@ -183,6 +210,7 @@ def main(
             model=autoencoder,
             classifier=mnist_classifier,
             dataloader=test_loader,
+            kid=kid,
             writer=writer,
             batch_size=batch_size,
             epoch_idx=epoch_idx,
